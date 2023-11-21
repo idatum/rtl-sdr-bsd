@@ -1,0 +1,221 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 687bf59..d8cadcd 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -68,13 +68,7 @@ endif()
+ ########################################################################
+ find_package(Threads)
+ find_package(PkgConfig)
+-
+-if(PKG_CONFIG_FOUND)
+-    pkg_check_modules(LIBUSB libusb-1.0 IMPORTED_TARGET)
+-else()
+-    set(LIBUSB_LIBRARIES "" CACHE STRING "manual libusb path")
+-    set(LIBUSB_INCLUDE_DIRS "" CACHE STRING "manual libusb includepath")
+-endif()
++find_package(LibUSB)
+ 
+ if(MSVC)
+     set(THREADS_PTHREADS_LIBRARY "" CACHE STRING "manual pthread-win32 path")
+@@ -90,6 +84,14 @@ endif()
+ if(NOT THREADS_FOUND)
+     message(FATAL_ERROR "pthreads(-win32) required to compile rtl-sdr")
+ endif()
++########################################################################
++# Setup the include and linker paths
++########################################################################
++include_directories(
++    ${CMAKE_SOURCE_DIR}/include
++    ${LIBUSB_INCLUDE_DIR}
++    ${THREADS_PTHREADS_INCLUDE_DIR}
++)
+ 
+ ########################################################################
+ # Create uninstall target
+diff --git a/src/rtl_fm.c b/src/rtl_fm.c
+index 037793c..6317df6 100644
+--- a/src/rtl_fm.c
++++ b/src/rtl_fm.c
+@@ -795,7 +795,7 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
+ 			buf[i] = 127;}
+ 		s->mute = 0;
+ 	}
+-	if (!s->offset_tuning) {
++	if (s->offset_tuning) {
+ 		rotate_90(buf, len);}
+ 	for (i=0; i<(int)len; i++) {
+ 		s->buf16[i] = (int16_t)buf[i] - 127;}
+@@ -867,7 +867,7 @@ static void optimal_settings(int freq, int rate)
+ 	}
+ 	capture_freq = freq;
+ 	capture_rate = dm->downsample * dm->rate_in;
+-	if (!d->offset_tuning) {
++	if (d->offset_tuning) {
+ 		capture_freq = freq + capture_rate/4;}
+ 	capture_freq += cs->edge * dm->rate_in / 2;
+ 	dm->output_scale = (1<<15) / (128 * dm->downsample);
+diff --git a/src/rtl_tcp.c b/src/rtl_tcp.c
+index 78d625a..6f9d069 100644
+--- a/src/rtl_tcp.c
++++ b/src/rtl_tcp.c
+@@ -62,6 +62,7 @@ typedef int socklen_t;
+ 
+ static SOCKET s;
+ 
++static pthread_t rtlsdr_read_worker_thread;
+ static pthread_t tcp_worker_thread;
+ static pthread_t command_thread;
+ static pthread_cond_t exit_cond;
+@@ -90,6 +91,7 @@ static struct llist *ll_buffers = 0;
+ static int llbuf_num = DEFAULT_MAX_NUM_BUFFERS;
+ 
+ static volatile int do_exit = 0;
++static volatile int do_read_sync = 0;
+ 
+ 
+ void usage(void)
+@@ -106,6 +108,7 @@ void usage(void)
+ 	printf("\t[-P ppm_error (default: 0)]\n");
+ 	printf("\t[-T enable bias-T on GPIO PIN 0 (works for rtl-sdr.com v3 dongles)]\n");
+ 	printf("\t[-D enable direct sampling (default: off)]\n");
++	printf("\t[-S use rtlsdr_ready_sync (default: off)]\n");
+ 	exit(1);
+ }
+ 
+@@ -145,9 +148,10 @@ sighandler(int signum)
+ #else
+ static void sighandler(int signum)
+ {
+-	signal(SIGPIPE, SIG_IGN);
+ 	fprintf(stderr, "Signal caught, exiting!\n");
+-	rtlsdr_cancel_async(dev);
++	if (!do_read_sync) {
++		rtlsdr_cancel_async(dev);
++	}
+ 	do_exit = 1;
+ }
+ #endif
+@@ -197,6 +201,27 @@ void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
+ 	}
+ }
+ 
++static void *rtlsdr_read_worker(void *arg)
++{
++	int r, n_read;
++	const int BLOCK_SIZE = 16 * 16384;
++	uint8_t *buffer;
++	
++	printf("rtlsdr_read_worker thread started.\n");
++	buffer = malloc(BLOCK_SIZE * sizeof(uint8_t));
++	while (!do_exit) {
++		r = rtlsdr_read_sync(dev, buffer, BLOCK_SIZE, &n_read);
++    	if (r < 0) {
++			fprintf(stderr, "WARNING: sync read failed.\n");
++			continue;
++		}
++		rtlsdr_callback(buffer, n_read, NULL);
++	}
++	free(buffer);
++	printf("rtlsdr_read_worker thread exiting.\n");
++	pthread_exit(NULL);
++}
++
+ static void *tcp_worker(void *arg)
+ {
+ 	struct llist *curelem,*prev;
+@@ -415,7 +440,7 @@ int main(int argc, char **argv)
+ 	struct sigaction sigact, sigign;
+ #endif
+ 
+-	while ((opt = getopt(argc, argv, "a:p:f:g:s:b:n:d:P:TD")) != -1) {
++	while ((opt = getopt(argc, argv, "a:p:f:g:s:b:n:d:P:TD:S")) != -1) {
+ 		switch (opt) {
+ 		case 'd':
+ 			dev_index = verbose_device_search(optarg);
+@@ -451,6 +476,9 @@ int main(int argc, char **argv)
+ 		case 'D':
+ 			direct_sampling = 1;
+ 			break;
++		case 'S':
++			do_read_sync = 1;
++			break;
+ 		default:
+ 			usage();
+ 			break;
+@@ -634,9 +662,19 @@ int main(int argc, char **argv)
+ 		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
+ 		r = pthread_create(&tcp_worker_thread, &attr, tcp_worker, NULL);
+ 		r = pthread_create(&command_thread, &attr, command_worker, NULL);
++		if (do_read_sync) {
++			printf("Using rtlsdr_read_sync\n");
++			r = pthread_create(&rtlsdr_read_worker_thread, &attr, rtlsdr_read_worker, NULL);
++		}
+ 		pthread_attr_destroy(&attr);
+ 
+-		r = rtlsdr_read_async(dev, rtlsdr_callback, NULL, buf_num, 0);
++		if (!do_read_sync) {
++			printf("Using rtlsdr_read_async\n");
++			r = rtlsdr_read_async(dev, rtlsdr_callback, NULL, buf_num, 0);
++		}
++		else {
++			pthread_join(rtlsdr_read_worker_thread, &status);
++		}
+ 
+ 		pthread_join(tcp_worker_thread, &status);
+ 		pthread_join(command_thread, &status);
+diff --git a/cmake/Modules/FindLibUSB.cmake b/cmake/Modules/FindLibUSB.cmake
+new file mode 100644
+index 0000000..7229853
+--- /dev/null
++++ b/cmake/Modules/FindLibUSB.cmake
+@@ -0,0 +1,50 @@
++if(NOT LIBUSB_FOUND)
++  pkg_check_modules (LIBUSB_PKG libusb-1.0)
++  find_path(LIBUSB_INCLUDE_DIR NAMES libusb.h
++    PATHS
++    ${LIBUSB_PKG_INCLUDE_DIRS}
++    /usr/include/libusb-1.0
++    /usr/include
++    /usr/local/include
++  )
++
++#standard library name for libusb-1.0
++set(libusb1_library_names usb-1.0)
++
++#libusb-1.0 compatible library on freebsd
++if((CMAKE_SYSTEM_NAME STREQUAL "FreeBSD") OR (CMAKE_SYSTEM_NAME STREQUAL "kFreeBSD"))
++    list(APPEND libusb1_library_names usb)
++endif()
++
++  find_library(LIBUSB_LIBRARIES
++    NAMES ${libusb1_library_names}
++    PATHS
++    ${LIBUSB_PKG_LIBRARY_DIRS}
++    /usr/lib
++    /usr/local/lib
++  )
++
++include(CheckFunctionExists)
++if(LIBUSB_INCLUDE_DIRS)
++    set(CMAKE_REQUIRED_INCLUDES ${LIBUSB_INCLUDE_DIRS})
++endif()
++if(LIBUSB_LIBRARIES)
++    set(CMAKE_REQUIRED_LIBRARIES ${LIBUSB_LIBRARIES})
++endif()
++
++CHECK_FUNCTION_EXISTS("libusb_error_name" HAVE_LIBUSB_ERROR_NAME)
++if(HAVE_LIBUSB_ERROR_NAME)
++    add_definitions(-DHAVE_LIBUSB_ERROR_NAME=1)
++endif(HAVE_LIBUSB_ERROR_NAME)
++
++if(LIBUSB_INCLUDE_DIR AND LIBUSB_LIBRARIES)
++  set(LIBUSB_FOUND TRUE CACHE INTERNAL "libusb-1.0 found")
++  message(STATUS "Found libusb-1.0: ${LIBUSB_INCLUDE_DIR}, ${LIBUSB_LIBRARIES}")
++else(LIBUSB_INCLUDE_DIR AND LIBUSB_LIBRARIES)
++  set(LIBUSB_FOUND FALSE CACHE INTERNAL "libusb-1.0 found")
++  message(STATUS "libusb-1.0 not found.")
++endif(LIBUSB_INCLUDE_DIR AND LIBUSB_LIBRARIES)
++
++mark_as_advanced(LIBUSB_INCLUDE_DIR LIBUSB_LIBRARIES)
++
++endif(NOT LIBUSB_FOUND)
